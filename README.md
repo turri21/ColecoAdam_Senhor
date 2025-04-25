@@ -1,3 +1,13 @@
+-=(ColecoAdam_Senhor notes)=-
+
+Tested: Working Video 720p, 1080p & Sound.
+
+Dev notes:
+
+Added in ColecoAdam.qsf: set_global_assignment -name SYSTEMVERILOG_FILE rtl/bram.sv
+
+Added in rtl/tv80 the missing files: tv80n.v tv80s.v
+
 # [Coleco Adam](https://en.wikipedia.org/wiki/Coleco_Adam) for [MiSTer](https://mister-devel.github.io/MkDocs_MiSTer/)
 
 This core is a conversion of the Colecovision core into verilog. Adam support was added by alanswx and spacexguy (asicguy).  
