@@ -49,12 +49,12 @@
 #set_location_assignment PIN_AG24 -to VGA_VS
 #set_location_assignment PIN_AH27 -to VGA_EN
 
-set_instance_assignment -name VIRTUAL_PIN ON -to VGA_EN
+#set_instance_assignment -name VIRTUAL_PIN ON -to VGA_EN
 
-set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to VGA_EN
+#set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to VGA_EN
 
-set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to VGA_*
-set_instance_assignment -name CURRENT_STRENGTH_NEW 8MA -to VGA_*
+#set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to VGA_*
+#set_instance_assignment -name CURRENT_STRENGTH_NEW 8MA -to VGA_*
 
 #============================================================
 # AUDIO
