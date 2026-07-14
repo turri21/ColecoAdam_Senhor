@@ -51,110 +51,155 @@ void SimBlockDevice::MountDisk( std::string file, int index) {
 }
 
 
+// ---------------------------------------------------------------------------
+// This shim used to be much friendlier to the core than the real HPS is, and it
+// hid a real bug for years: floppy writes worked in simulation and corrupted the
+// CP/M directory on hardware. Three divergences mattered:
+//
+//  1. It zeroed sd_buff_addr the instant it saw sd_rd/sd_wr. Real hps_io only
+//     rezeroes sd_buff_addr when *it* starts a command, and leaves it stuck at
+//     511 in between (hps_io.sv:292,348,414). A core that uses "&sd_buff_addr"
+//     to mean "transfer done" therefore sees a stale 511 the moment it starts a
+//     transfer, and declares the transfer complete before a single byte moved.
+//     That could never happen here, so it never showed up in sim.
+//     -> We now leave sd_buff_addr at 511 between transfers and only zero it
+//        when the transfer actually begins.
+//
+//  2. It sampled sd_buff_din in the same eval in which it drove sd_buff_addr,
+//     so it only worked against a zero-latency (combinational) buffer RAM. Real
+//     hps_io holds the address for several clk_sys cycles before latching the
+//     data, which is why registered BRAM is fine on hardware. Modelling this is
+//     what stops the "data is off by N bytes" chases.
+//     -> The address is now held SIM_SD_DIN_LATENCY cycles before we sample.
+//
+//  3. Every request was served exactly once, immediately. The real HPS takes
+//     ~ms and has been observed serving a block TWICE (see the IIgs core).
+//     -> SIM_SD_LATENCY models the delay; SIM_SD_DOUBLE_SERVE=1 replays each
+//        block to prove the core's transfers are idempotent.
+//
+// Env knobs: SIM_SD_LATENCY (default 1200), SIM_SD_DIN_LATENCY (default 2),
+//            SIM_SD_DOUBLE_SERVE (default 0).
+// ---------------------------------------------------------------------------
 void SimBlockDevice::BeforeEval(int cycles)
 {
-//
-// switch to a new disk if current_disk is -1
-// check to see if we need a read or a write or a mount
-//
-
 // wait until the computer boots to start mounting, etc
  if (cycles<2000) return;
 
- for (int i=0; i<kVDNUM;i++)
- {
+ // ---- mounts (only while no transfer is in flight) ----
+ if (xfer_state == X_IDLE) {
+   for (int i=0; i<kVDNUM; i++) {
+     if (mountQueue[i] && !*img_mounted) {
+       fprintf(stderr,"mounting.. %d size %ld\n", i, disk_size[i]);
+       mountQueue[i]  = 0;
+       *img_size      = disk_size[i];
+       *img_readonly  = 0;
+       disk[i].clear();
+       disk[i].seekg(0);
+       bitset(*img_mounted, i);
+       ack_delay = 1200;               // hold img_mounted for a while
+     } else if (bitcheck(*img_mounted, i)) {
+       if (ack_delay > 0) ack_delay--;
+       if (ack_delay == 0) bitclear(*img_mounted, i);
+     }
+   }
+ }
 
-   //if (current_disk == 0)
-   //fprintf(stderr,"current_disk = %d *sd_rd %x ack_delay %x reading %d writing %d\n",current_disk,*sd_rd,ack_delay,reading,writing);
+ // ---- block transfer engine ----
+ switch (xfer_state) {
 
-    if (current_disk == i) {
-    // send data
-    if (ack_delay==1) {
-      if (reading && (*sd_buff_wr==0) &&  (bytecnt<kBLKSZ)) {
-         *sd_buff_dout = disk[i].get();
-         *sd_buff_addr = bytecnt++;
-         *sd_buff_wr= 1;
-         //printf("cycles %x reading %X : %X ack %x\n",cycles,*sd_buff_addr,*sd_buff_dout,*sd_ack );
-      } else if(writing && *sd_buff_addr != bytecnt && (*sd_buff_addr< kBLKSZ)) {
-      //} else if(writing && (bytecnt < kBLKSZ)) {
-        //printf("writing disk %i at sd_buff_addr %x data %x ack %x\n",i,*sd_buff_addr,*sd_buff_din[i],*sd_ack);
-        disk[i].put(*(sd_buff_din[i]));
-        *sd_buff_addr = bytecnt;
-      } else {
-          *sd_buff_wr=0;
+ case X_IDLE: {
+   *sd_buff_wr = 0;
+   // NOTE: sd_buff_addr is deliberately NOT touched here. Real hps_io leaves it
+   // wherever the last transfer left it (511). The core must not depend on it.
+   for (int i=0; i<kVDNUM; i++) {
+     if (bitcheck(*sd_rd,i) || bitcheck(*sd_wr,i)) {
+       current_disk = i;
+       reading      = bitcheck(*sd_rd,i) != 0;
+       writing      = bitcheck(*sd_wr,i) != 0;
+       long lba     = (long)(*(sd_lba[i]));
+       disk[i].clear();
+       if (writing) disk[i].seekp(lba * kBLKSZ);
+       else         disk[i].seekg(lba * kBLKSZ);
+       served_once = false;
+       xfer_wait   = cfg_latency;      // the HPS is not instant
+       xfer_state  = X_WAIT;
+       break;
+     }
+   }
+   break;
+ }
 
-          if (writing) {
-                  if (bytecnt>=kBLKSZ) {
-                          writing=0;
-                          //printf("writing stopped: bytecnt %x sd_buff_addr %x \n",bytecnt,*sd_buff_addr);
-                  }
-                  if (bytecnt<kBLKSZ)
-                        bytecnt++;
-          }
-          else if (reading) {
-                if(bytecnt == kBLKSZ) {
-                        reading = 0;
-                }
-        }
-      }
-    } else {
-          *sd_buff_wr=0;
-    }
-    }
+ case X_WAIT: {
+   // The core must hold sd_rd/sd_wr until we ack; that is the contract.
+   if (--xfer_wait <= 0) {
+     bitset(*sd_ack, current_disk);
+     bytecnt       = 0;
+     *sd_buff_addr = 0;               // only now, exactly as hps_io does
+     din_pipe      = cfg_din_latency;
+     xfer_state    = X_ACTIVE;
+   }
+   break;
+ }
 
-    // issue a mount if we aren't doing anything, and the img_mounted has no bits set
-    if (!reading && !writing && mountQueue[i] && !*img_mounted) {
-fprintf(stderr,"mounting.. %d\n",i);
-           mountQueue[i]=0;
-           *img_size = disk_size[i];
-           *img_readonly=0;
-fprintf(stderr,"img_size .. %ld\n",*img_size);
-           disk[i].seekg(0);
-           bitset(*img_mounted,i);
-           ack_delay=1200;
-    } else if (ack_delay==1 && bitcheck(*img_mounted,i) ) {
-fprintf(stderr,"mounting flag cleared  %d\n",i);
-        bitclear(*img_mounted,i) ;
-        //*img_size = 0;
-    } else { if (!reading && !writing && ack_delay>0) ack_delay--; }
+ case X_ACTIVE: {
+   int i = current_disk;
+   if (reading) {
+     if (bytecnt < kBLKSZ) {
+       *sd_buff_dout = disk[i].get();
+       *sd_buff_addr = bytecnt;
+       *sd_buff_wr   = 1;
+       bytecnt++;
+     } else {
+       *sd_buff_wr = 0;
+       xfer_state  = X_DONE;
+     }
+   } else if (writing) {
+     // hold the address a few cycles before latching, so a registered BRAM
+     // (which is what the FPGA infers) reads out correctly.
+     if (din_pipe > 0) {
+       din_pipe--;
+     } else {
+       disk[i].put((char)(*(sd_buff_din[i])));
+       bytecnt++;
+       if (bytecnt < kBLKSZ) {
+         *sd_buff_addr = bytecnt;
+         din_pipe      = cfg_din_latency;
+       } else {
+         xfer_state = X_DONE;
+       }
+     }
+   } else {
+     xfer_state = X_DONE;
+   }
+   break;
+ }
 
-    // start reading when sd_rd pulses high
-    if ((current_disk==-1 || current_disk==i) && (bitcheck(*sd_rd,i) || bitcheck(*sd_wr,i) )) {
-       // set current disk here..
-//fprintf(stderr,"setting current disk %d %x ack_delay %x\n",i,*sd_rd,ack_delay);
-       current_disk=i;
-      if (!ack_delay) {
-        int lba = *(sd_lba[i]);
-        if (bitcheck(*sd_rd,i)) {
-                reading = true;
-        }
-        if (bitcheck(*sd_wr,i)) {
-                writing = true;
-        }
+ case X_DONE: {
+   int i = current_disk;
+   *sd_buff_wr = 0;
+   bitclear(*sd_ack, i);
+   // hps_io saturates the address and leaves it here until its next command.
+   *sd_buff_addr = kBLKSZ - 1;
+   disk[i].flush();
 
-        disk[i].clear();
-        disk[i].seekg((lba) * kBLKSZ);
-      //  printf("seek %06X lba: (%x) (%d,%d) drive %d reading %d writing %d ack %x\n", (lba) * kBLKSZ,lba,lba,kBLKSZ,i,reading,writing,*sd_ack);
-        bytecnt = 0;
-        *sd_buff_addr = 0;
-        ack_delay = 1200;
-      }
-    }
-
-    if (current_disk == i) {
-      if (ack_delay==1) {
-           bitset(*sd_ack,i);
-           //printf("setting sd_ack: %x\n",*sd_ack);
-      } else {
-           bitclear(*sd_ack,i);
-           //printf("clearing sd_ack: %x\n",*sd_ack);
-      }
-      if((ack_delay > 1) || ((ack_delay == 1) && !reading && !writing))
-        ack_delay--;
-      if (ack_delay==0 && !reading && !writing)
-        current_disk=-1;
-    }
-  }
+   if (cfg_double_serve && !served_once) {
+     // The real HPS has been seen serving the same block twice. Replay it: a
+     // correct core is idempotent (it must not, say, advance its LBA per pass).
+     served_once = true;
+     long lba = (long)(*(sd_lba[i]));
+     disk[i].clear();
+     if (writing) disk[i].seekp(lba * kBLKSZ);
+     else         disk[i].seekg(lba * kBLKSZ);
+     xfer_wait  = cfg_latency;
+     xfer_state = X_WAIT;
+   } else {
+     reading = writing = false;
+     current_disk = -1;
+     xfer_state   = X_IDLE;
+   }
+   break;
+ }
+ }
 }
 
 void SimBlockDevice::AfterEval()
@@ -162,9 +207,29 @@ void SimBlockDevice::AfterEval()
 }
 
 
+static int env_int(const char *name, int dflt) {
+        const char *e = getenv(name);
+        return e ? atoi(e) : dflt;
+}
+
 SimBlockDevice::SimBlockDevice(DebugConsole c) {
         console = c;
         current_disk=-1;
+
+        xfer_state  = X_IDLE;
+        xfer_wait   = 0;
+        din_pipe    = 0;
+        served_once = false;
+        bytecnt     = 0;
+        reading     = false;
+        writing     = false;
+        ack_delay   = 0;
+
+        cfg_latency      = env_int("SIM_SD_LATENCY", 1200);
+        cfg_din_latency  = env_int("SIM_SD_DIN_LATENCY", 2);
+        cfg_double_serve = env_int("SIM_SD_DOUBLE_SERVE", 0);
+        fprintf(stderr, "BLKDEV: latency=%d din_latency=%d double_serve=%d\n",
+                cfg_latency, cfg_din_latency, cfg_double_serve);
 
         sd_rd = NULL;
         sd_wr = NULL;

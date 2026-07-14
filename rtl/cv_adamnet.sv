@@ -247,6 +247,7 @@ module cv_adamnet
   //
   logic         kbd_req;
   logic         kbd_done;
+  logic         kbd_partial;  // completed a CMD_READ with fewer keys than asked
   logic [3:0]   kbd_dev;
 
   assign max_dcb = pcb_table.pcb_max_dcb;
@@ -654,7 +655,8 @@ module cv_adamnet
 
     // We don't handle the error
     if (disk_done) dcb_table[done_dev].dcb_cmd_stat <= RSP_STATUS;
-    if (kbd_done)  dcb_table[kbd_dev].dcb_cmd_stat <= RSP_STATUS;
+    // short read (fewer keys than requested) reports RSP_STATUS + 0x0C, as ColEm does
+    if (kbd_done)  dcb_table[kbd_dev].dcb_cmd_stat <= kbd_partial ? (RSP_STATUS + 8'h0C) : RSP_STATUS;
     if (set_lastblock) begin
       disk_lastblock[done_dev] <= sec;
     end
@@ -753,11 +755,9 @@ module cv_adamnet
   logic        lastpress;
   logic        press_btn;
   logic [7:0]  code;
-  logic        input_strobe;
   logic [15:0] kbd_buffer;
   logic [15:0] kbd_len;
   logic [15:0] kbd_ramb_addr;
-  logic        clear_strobe;
   logic [7:0]  key_code;
   logic [7:0]  shift_key_code;
   logic [7:0]  ctrl_key_code;
@@ -769,31 +769,52 @@ module cv_adamnet
   logic [22:0] key_rep_timer;
   logic        disk_active;
 
+  // Keystroke FIFO.
+  //
+  // Keys used to be held in a single slot and, worse, the ASCII byte was decoded
+  // combinationally from the LIVE ps2_key at the moment EOS got around to
+  // consuming it -- by which time ps2_key usually held the key *release* event,
+  // which decodes to 0x00 (^@). Any key pressed while the disk FSM was busy was
+  // simply dropped, since the RAM port could only be stolen when disk_state was
+  // DISK_IDLE. Now the byte is decoded at press time and queued, so it no longer
+  // matters how long EOS takes to come collect it.
+  localparam int KBD_FIFO_AW = 4;                  // 16 keys
+  logic [7:0]              kbd_fifo[2**KBD_FIFO_AW];
+  logic [KBD_FIFO_AW-1:0]  kbd_wp, kbd_rp;
+  logic                    kbd_empty;
+  logic                    kbd_full;
+  logic [7:0]              kbd_byte;               // decoded at press time
+
+  assign kbd_empty = (kbd_wp == kbd_rp);
+  assign kbd_full  = ((kbd_wp + 1'b1) == kbd_rp);
+  // the key as it reads *right now*, while ps2_key still holds the press
+  assign kbd_byte  = ctrl ? ctrl_key_code : (shift | caps_lock) ? shift_key_code : key_code;
+
   initial begin
     disk_state = DISK_IDLE;
     tape_state = DISK_IDLE;
     kbd_state  = KBD_IDLE;
   end
 
-  assign watch_key = (kbd_state == KBD_KEY) && (disk_state == DISK_IDLE);
+  assign watch_key = (kbd_state == KBD_KEY) && (disk_state == DISK_IDLE) && !kbd_empty;
 
   assign disk_sector = disk_active ? {disk_sec[31:3], InterleaveTable(disk_sec[2:0])} : disk_sec;
 
   always_ff @(posedge clk_i) begin
-    ramb_addr        <= watch_key && input_strobe & ~clear_strobe ? kbd_buffer : int_ramb_addr[0];
-    ramb_wr          <= watch_key && input_strobe & ~clear_strobe ? '1 : int_ramb_wr[0];
-    ramb_rd          <= watch_key && input_strobe & ~clear_strobe ? '0 : int_ramb_rd[0];
-    kbd_data         <= ctrl? ctrl_key_code : (shift|caps_lock) ? shift_key_code  : key_code;
-    int_ramb_addr[1] <= watch_key && input_strobe & ~clear_strobe ? kbd_buffer : int_ramb_addr[0];
-    int_ramb_wr[1]   <= watch_key && input_strobe & ~clear_strobe ? '1 : int_ramb_wr[0];
-    int_ramb_rd[1]   <= watch_key && input_strobe & ~clear_strobe ? '0: int_ramb_rd[0];
+    ramb_addr        <= watch_key ? kbd_buffer : int_ramb_addr[0];
+    ramb_wr          <= watch_key ? '1 : int_ramb_wr[0];
+    ramb_rd          <= watch_key ? '0 : int_ramb_rd[0];
+    kbd_data         <= kbd_fifo[kbd_rp];   // key as decoded when it was pressed
+    int_ramb_addr[1] <= watch_key ? kbd_buffer : int_ramb_addr[0];
+    int_ramb_wr[1]   <= watch_key ? '1 : int_ramb_wr[0];
+    int_ramb_rd[1]   <= watch_key ? '0: int_ramb_rd[0];
     int_ramb_wr[0]   <= '0;
     int_ramb_rd[0]   <= '0;
     disk_done        <= '0;
     disk_wr          <= '0;
     disk_flush       <= '0;
     kbd_done         <= '0;
-    kbd_sel          <= watch_key && input_strobe & ~clear_strobe;
+    kbd_sel          <= watch_key;
     adamnet_req_n    <= '1;
     set_lastblock    <= '0;
 
@@ -913,7 +934,10 @@ module cv_adamnet
       DISK_WRITE2: begin
         ramb_addr    <= ramb_addr;
         int_ramb_addr[0]    <= int_ramb_addr[0];
-        if (disk_flushed) begin
+        // only our own drive's flush completion may advance the sector: disk_flushed
+        // is a per-drive vector and reduction-OR let any other drive (or a read
+        // completion) step disk_sec early.
+        if (disk_flushed[disk_dev]) begin
           ramb_addr    <= ramb_addr - 1'b1;
           data_counter <= '0;
           disk_sec     <= disk_sec + 1'b1; // Advance for next sector
@@ -993,23 +1017,31 @@ module cv_adamnet
                 else if (ps2_key[8:0] == 9'h007) osd <= ps2_key[9]; //OSD ignore key
 
       else begin
-        press_btn    <= ps2_key[9];
-        code         <= ps2_key[7:0];
-        input_strobe <= '1;
+        press_btn     <= ps2_key[9];
+        code          <= ps2_key[7:0];
         key_rep_timer <= 'd7000000;
+        // Queue the key NOW, while ps2_key still holds the press and the
+        // modifiers still reflect what was held down with it.
+        if (ps2_key[9] && !kbd_full) begin
+          kbd_fifo[kbd_wp] <= kbd_byte;
+          kbd_wp           <= kbd_wp + 1'b1;
+        end
       end
-    end else if (clear_strobe) begin
-        input_strobe <= '0;
     end else begin
         key_rep_timer <= key_rep_timer-1;
         if (key_rep_timer==0)
         begin
            key_rep_timer <= 933333;
-           input_strobe<= ps2_key[10];
+           // Auto-repeat, but only once the queue has drained. The repeat rate is
+           // ~45/s; queueing every tick would let a single held key flood the FIFO
+           // and duplicate characters (it was harmless when repeats merely
+           // overwrote the old single key slot).
+           if (press_btn && kbd_empty) begin
+             kbd_fifo[kbd_wp] <= kbd_byte;
+             kbd_wp           <= kbd_wp + 1'b1;
+           end
         end
     end
-
-    clear_strobe <= '0;
 
     case (kbd_state)
       KBD_IDLE: begin
@@ -1021,21 +1053,44 @@ module cv_adamnet
         end
       end
       KBD_KEY: begin
-        if (input_strobe && (disk_state == DISK_IDLE)) begin
-          clear_strobe                  <= '1;
-          if (press_btn) begin
-            // Keyboard data is available and disk is idle so we can
-            // write to the keyboard buffer
-            kbd_buffer                    <= kbd_buffer + 1'b1;
-            kbd_len                       <= kbd_len - 1'b1;
+        // A keyboard CMD_READ must NEVER block. ColEm (AdamNet.c UpdateKBD) is:
+        //
+        //   for(J=0 ; (J<N) && (V=GetKBD()) ; ++J, ...) RAM(A) = V;
+        //   KBDStatus = RSP_STATUS + (J<N ? 0x0C : 0x00);
+        //
+        // i.e. copy however many keys are actually queued (possibly none) and
+        // finish, flagging a short read with +0x0C. We used to sit here until we
+        // had delivered exactly `len` keys. When EOS polled an empty keyboard it
+        // got no completion, gave up, and moved on -- but we stayed in KBD_KEY
+        // holding that dead request's kbd_buffer/kbd_len. The next keypress was
+        // then written into the ABANDONED DCB and completed it, so EOS's next
+        // read never saw the key. That is the swallowed first keystroke.
+        if (kbd_len == 0) begin
+          // asked for nothing / already gave everything
+          kbd_state   <= KBD_IDLE;
+          kbd_done    <= '1;
+          kbd_partial <= '0;
+        end else if (!watch_key) begin
+          // Can't deliver right now -- FIFO empty, or the disk FSM owns the RAM
+          // port. Either way finish short rather than hold the request open; the
+          // key stays queued and EOS picks it up on its next poll.
+          kbd_state   <= KBD_IDLE;
+          kbd_done    <= '1;
+          kbd_partial <= '1;
+        end else begin
+          // watch_key = EOS wants a key, disk FSM is idle, FIFO has one.
+          // The RAM write is issued by the muxes above.
+          kbd_rp     <= kbd_rp + 1'b1;
+          kbd_buffer <= kbd_buffer + 1'b1;
+          kbd_len    <= kbd_len - 1'b1;
 
-            if (kbd_len == 1) begin
-              kbd_state <= KBD_IDLE;
-              kbd_done  <= '1;
-            end else begin
-              kbd_state <= KBD_PAUSE;
-            end
-          end // if (~press_btn)
+          if (kbd_len == 1) begin
+            kbd_state   <= KBD_IDLE;
+            kbd_done    <= '1;
+            kbd_partial <= '0;      // delivered the full N
+          end else begin
+            kbd_state <= KBD_PAUSE;
+          end
         end
       end // case: KBD_KEY
       KBD_PAUSE: kbd_state  <= KBD_KEY;
@@ -1058,7 +1113,7 @@ always @(*) begin
         9'h007 : key_code = 'h87;	//F12 <OSD>
         9'h008 : key_code = 'h87;
         9'h009 : key_code = 'h87;	//F10
-        9'h00a : key_code = 'h87;	//F8
+        9'h00a : key_code = 'h90;	//F8 = WILD CARD
         9'h00b : key_code = 'h86;	//F6
         9'h00c : key_code = 'h84;	//F4
         9'h00d : key_code = 'h09;	//TAB
@@ -1179,7 +1234,7 @@ always @(*) begin
         9'h080 : key_code = 'h87;
         9'h081 : key_code = 'h87;
         9'h082 : key_code = 'h87;
-        9'h083 : key_code = 'h87;	//F7
+        9'h083 : key_code = 'h91;	//F7 = UNDO
         9'h084 : key_code = 'h87;
         9'h085 : key_code = 'h87;
         9'h086 : key_code = 'h87;
@@ -1409,15 +1464,15 @@ always @(*) begin
         9'h166 : key_code = 'h87;
         9'h167 : key_code = 'h87;
         9'h168 : key_code = 'h87;
-        9'h169 : key_code = 'h87;	//END
+        9'h169 : key_code = 'h96;	//END = CLEAR
         9'h16a : key_code = 'h87;
         9'h16b : key_code = 'hA3;	//ARROW LEFT
         9'h16c : key_code = 'h80;	//HOME
         9'h16d : key_code = 'h87;
         9'h16e : key_code = 'h87;
         9'h16f : key_code = 'h87;
-        9'h170 : key_code = 'h87;	//INSERT = HELP
-        9'h171 : key_code = 'h0f;	//DELETE (KP clear?)
+        9'h170 : key_code = 'h94;	//INSERT
+        9'h171 : key_code = 'h97;	//DELETE (+CTRL = 7f)
         9'h172 : key_code = 'hA2;	//ARROW DOWN
         9'h173 : key_code = 'h87;
         9'h174 : key_code = 'hA1;	//ARROW RIGHT
@@ -1426,10 +1481,10 @@ always @(*) begin
         9'h177 : key_code = 'h87;
         9'h178 : key_code = 'h87;
         9'h179 : key_code = 'h87;
-        9'h17a : key_code = 'h87;	//PGDN <OSD>
+        9'h17a : key_code = 'h93;	//PGDN = STORE / FETCH
         9'h17b : key_code = 'h87;
-        9'h17c : key_code = 'h87;	//PRTSCR <OSD>
-        9'h17d : key_code = 'h87;	//PGUP <OSD>
+        9'h17c : key_code = 'h95;	//PRTSCR = PRINT
+        9'h17d : key_code = 'h92;	//PGUP = MOVE / COPY
         9'h17e : key_code = 'h87;	//ctrl+break
         9'h17f : key_code = 'h87;
         9'h180 : key_code = 'h87;

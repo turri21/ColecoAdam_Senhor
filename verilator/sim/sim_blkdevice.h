@@ -37,6 +37,17 @@ public:
 	bool mountQueue[kVDNUM];
 	std::fstream disk[kVDNUM];
 
+	// Block transfer engine. Modelled on what hps_io.sv actually does, not on
+	// what is convenient for the core -- see sim_blkdevice.cpp for why.
+	enum { X_IDLE, X_WAIT, X_ACTIVE, X_DONE };
+	int  xfer_state;
+	int  xfer_wait;    // cycles left before we ack (HPS service latency)
+	int  din_pipe;     // cycles the address is held before we sample sd_buff_din
+	bool served_once;  // for the double-serve stress mode
+	int  cfg_latency;      // SIM_SD_LATENCY
+	int  cfg_din_latency;  // SIM_SD_DIN_LATENCY
+	int  cfg_double_serve; // SIM_SD_DOUBLE_SERVE
+
 	void BeforeEval(int cycles);
 	void AfterEval(void);
 	//void QueueDownload(std::string file, int index);
