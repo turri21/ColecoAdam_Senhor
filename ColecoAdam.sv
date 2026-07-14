@@ -237,6 +237,8 @@ parameter CONF_STR = {
         "OAB,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
         "-;",
         "O3,Joysticks swap,No,Yes;",
+        "OD,Keypad on numpad,Off,On;",
+        "OE,Stick keypad,Off,On;",
         "-;",
         "OC,Mode,Computer,Console;",
         "R0,Reset;",
@@ -298,6 +300,9 @@ wire [63:0] img_size;
 
 wire [10:0] ps2_key;
 
+wire [15:0] joy0_l_analog, joy0_r_analog;
+wire [15:0] joy1_l_analog, joy1_r_analog;
+
 hps_io #(.CONF_STR(CONF_STR), .VDNUM(TOT_DISKS)) hps_io
 (
    .clk_sys(clk_sys),
@@ -328,7 +333,13 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(TOT_DISKS)) hps_io
 
 
    .joystick_0(joy0),
-   .joystick_1(joy1)
+   .joystick_1(joy1),
+
+   // analog sticks, for the on-screen keypad
+   .joystick_l_analog_0(joy0_l_analog),
+   .joystick_r_analog_0(joy0_r_analog),
+   .joystick_l_analog_1(joy1_l_analog),
+   .joystick_r_analog_1(joy1_r_analog)
 );
 
 
@@ -715,6 +726,59 @@ always @(posedge CLK_VIDEO) begin
         if(~hs_o & ~hsync) vs_o <= ~vsync;
 end
 
+//////////////// On-screen keypad (ported from the Jaguar core's numstick) //////
+//
+// A ColecoVision pad has a 12 key keypad; a modern gamepad does not have twelve
+// spare buttons to bind it to. Nudging an analog stick pops up a keypad overlay:
+// right stick = the 1..9 grid, left stick = the * 0 # row, hold a direction for
+// ~0.5s to press. Output is a 12 bit one-hot that we simply OR into the same
+// keypad bits a physical button binding would drive, so both still work.
+//
+// Geometry is retuned for the TMS9918's 256x192 active area (Jaguar's defaults
+// are sized for 640x240 and would swallow the screen), and the cycle counts are
+// rescaled from Jaguar's 106MHz clk_sys to ours (~42.95MHz).
+
+wire [7:0] mix_r, mix_g, mix_b;
+wire [11:0] vkeypad;              // bit0='1'..bit8='9', bit9='0', bit10='*', bit11='#'
+wire        vkeypad_en = status[14];
+
+// follow the joystick swap so the overlay always drives whoever is player A
+wire [15:0] joya_l_analog = status[3] ? joy1_l_analog : joy0_l_analog;
+wire [15:0] joya_r_analog = status[3] ? joy1_r_analog : joy0_r_analog;
+
+numstick #(
+        .HOLD_CYCLES     (21477000),   // ~0.5s  @ 42.95MHz
+        .PRESS_CYCLES    (3221000),    // ~75ms
+        .RECENTER_CYCLES (859000),     // ~20ms
+        .DEFAULT_ACTIVE_W(256),
+        .DEFAULT_ACTIVE_H(192),
+        .CELL_W          (32),
+        .CELL_H          (16),
+        .CELL_GAP        (2),
+        .BOX_PAD         (4),
+        .STACK_GAP       (4),
+        .BORDER_THICKNESS(1)
+) numstick
+(
+        .clk_sys  (clk_sys),
+        .ce_pix   (ce_5m3),
+        .reset    (reset),
+        .enable   (vkeypad_en),
+        .hblank   (hblank),
+        .vblank   (vblank),
+        .in_r     (R),
+        .in_g     (G),
+        .in_b     (B),
+        .stick_l_x($signed(joya_l_analog[7:0])),
+        .stick_l_y($signed(joya_l_analog[15:8])),
+        .stick_r_x($signed(joya_r_analog[7:0])),
+        .stick_r_y($signed(joya_r_analog[15:8])),
+        .keypad_press(vkeypad),
+        .out_r    (mix_r),
+        .out_g    (mix_g),
+        .out_b    (mix_b)
+);
+
 video_mixer #(.LINE_LENGTH(290), .GAMMA(1)) video_mixer
 (
         .*,
@@ -726,9 +790,9 @@ video_mixer #(.LINE_LENGTH(290), .GAMMA(1)) video_mixer
         .hq2x(scale==1),
 
         .VGA_DE(vga_de),
-        .R(R),
-        .G(G),
-        .B(B),
+        .R(mix_r),
+        .G(mix_g),
+        .B(mix_b),
 
         // Positive pulses.
         .HSync(hs_o),
@@ -738,8 +802,14 @@ video_mixer #(.LINE_LENGTH(290), .GAMMA(1)) video_mixer
 );
 
 //////////////// Keypad emulation (by Alan Steremberg) ///////
-
-`ifdef DO_KEYPAD_EMULATION
+//
+// Numeric-keypad -> ColecoVision keypad. This was written long ago but sat
+// behind an `ifdef DO_KEYPAD_EMULATION that was never defined anywhere, so it
+// was dead code. It is now a runtime OSD option instead ("Keypad on numpad").
+//
+// Only the NUMPAD scancodes are used, deliberately: the top-row digits are left
+// alone so that typing 1..9 into SmartWriter/CP/M still types digits rather than
+// also mashing the game keypad.
 wire       pressed = ps2_key[9];
 wire [8:0] code    = ps2_key[8:0];
 always @(posedge clk_sys) begin
@@ -747,55 +817,28 @@ always @(posedge clk_sys) begin
         old_state <= ps2_key[10];
 
         if(old_state != ps2_key[10]) begin
-                casex(code)
-
-                        'hX16: btn_1     <= pressed; // 1
-                        'hX1E: btn_2     <= pressed; // 2
-                        'hX26: btn_3     <= pressed; // 3
-                        'hX25: btn_4     <= pressed; // 4
-                        'hX2E: btn_5     <= pressed; // 5
-                        'hX36: btn_6     <= pressed; // 6
-                        'hX3D: btn_7     <= pressed; // 7
-                        'hX3E: btn_8     <= pressed; // 8
-                        'hX46: btn_9     <= pressed; // 9
-                        'hX45: btn_0     <= pressed; // 0
-
-                        'hX69: btn_1     <= pressed; // 1
-                        'hX72: btn_2     <= pressed; // 2
-                        'hX7A: btn_3     <= pressed; // 3
-                        'hX6B: btn_4     <= pressed; // 4
-                        'hX73: btn_5     <= pressed; // 5
-                        'hX74: btn_6     <= pressed; // 6
-                        'hX6C: btn_7     <= pressed; // 7
-                        'hX75: btn_8     <= pressed; // 8
-                        'hX7D: btn_9     <= pressed; // 9
-                        'hX70: btn_0     <= pressed; // 0
-
-                        'hX7C: btn_star  <= pressed; // *
-                        'hX59: btn_shift <= pressed; // Right Shift
-                        'hX12: btn_shift <= pressed; // Left Shift
-                        'hX7B: btn_minus <= pressed; // - on keypad
-
-
+                case(code)
+                        9'h070: btn_0     <= pressed; // KP 0
+                        9'h069: btn_1     <= pressed; // KP 1
+                        9'h072: btn_2     <= pressed; // KP 2
+                        9'h07A: btn_3     <= pressed; // KP 3
+                        9'h06B: btn_4     <= pressed; // KP 4
+                        9'h073: btn_5     <= pressed; // KP 5
+                        9'h074: btn_6     <= pressed; // KP 6
+                        9'h06C: btn_7     <= pressed; // KP 7
+                        9'h075: btn_8     <= pressed; // KP 8
+                        9'h07D: btn_9     <= pressed; // KP 9
+                        9'h07C: btn_star  <= pressed; // KP *  -> *
+                        9'h07B: btn_hash  <= pressed; // KP -  -> #
+                        default: ;
                 endcase
         end
 end
 
-reg btn_1 = 0;
-reg btn_2 = 0;
-reg btn_3 = 0;
-reg btn_4 = 0;
-reg btn_5 = 0;
-reg btn_6 = 0;
-reg btn_7 = 0;
-reg btn_8 = 0;
-reg btn_9 = 0;
-reg btn_0 = 0;
-
+reg btn_0 = 0, btn_1 = 0, btn_2 = 0, btn_3 = 0, btn_4 = 0;
+reg btn_5 = 0, btn_6 = 0, btn_7 = 0, btn_8 = 0, btn_9 = 0;
 reg btn_star = 0;
-reg btn_shift = 0;
-reg btn_minus = 0;
-`endif
+reg btn_hash = 0;
 
 ////////////////  Control  ////////////////////////
 //	"J1,dir,dir,dir,dir,Fire 1,Fire 2,*,#,[8]0,1,2,3,4,5,6,7,8,9,Purple Tr,Blue Tr;",
@@ -804,12 +847,24 @@ reg btn_minus = 0;
 
 wire [0:19] keypad0 = {joya[8],joya[9],joya[10],joya[11],joya[12],joya[13],joya[14],joya[15],joya[16],joya[17],joya[6],joya[7],joya[18],joya[19],joya[3],joya[2],joya[1],joya[0],joya[4],joya[5]};
 wire [0:19] keypad1 = {joyb[8],joyb[9],joyb[10],joyb[11],joyb[12],joyb[13],joyb[14],joyb[15],joyb[16],joyb[17],joyb[6],joyb[7],joyb[18],joyb[19],joyb[3],joyb[2],joyb[1],joyb[0],joyb[4],joyb[5]};
-`ifdef DO_KEYPAD_EMULATION
-wire [0:19] keyboardemu = { btn_0, btn_1, btn_2, btn_3, btn_4, btn_5, btn_6, btn_7, btn_8, btn_9, btn_star | (btn_8&btn_shift), btn_minus | (btn_shift & btn_3), 8'b0};
-wire [0:19] keypad[2] = '{keypad0|keyboardemu,keypad1|keyboardemu};
-`else
-wire [0:19] keypad[2] = '{keypad0,keypad1};
-`endif
+// keypad[i] layout is [0]=0 .. [9]=9, [10]='*', [11]='#', [12]=Purple, [13]=Blue,
+// [14:17]=dpad, [18]=Fire1, [19]=Fire2.
+
+// numpad keys -> keypad, when enabled in the OSD
+wire [0:19] keyboardemu = status[13] ?
+        {btn_0, btn_1, btn_2, btn_3, btn_4, btn_5, btn_6, btn_7, btn_8, btn_9,
+         btn_star, btn_hash, 8'b0} : 20'b0;
+
+// on-screen stick keypad -> keypad (player A only). numstick's one-hot runs
+// bit0='1'..bit8='9', bit9='0', bit10='*', bit11='#', so reorder to ours.
+wire [0:19] stickpad = vkeypad_en ?
+        {vkeypad[9], vkeypad[0], vkeypad[1], vkeypad[2], vkeypad[3], vkeypad[4],
+         vkeypad[5], vkeypad[6], vkeypad[7], vkeypad[8], vkeypad[10], vkeypad[11],
+         8'b0} : 20'b0;
+
+// OR them together with the physical button bindings, so all three keep working
+wire [0:19] keypad[2] = '{keypad0 | keyboardemu | stickpad,
+                          keypad1 | keyboardemu};
 
 reg [3:0] ctrl1[2] = '{'0,'0};
 assign {ctrl_p1[0],ctrl_p2[0],ctrl_p3[0],ctrl_p4[0]} = ctrl1[0];

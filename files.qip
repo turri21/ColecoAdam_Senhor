@@ -32,4 +32,5 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cv_por.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cv_console.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cv_adamnet.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/track_loader_adam.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/numstick.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ColecoAdam.sv
