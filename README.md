@@ -1,3 +1,7 @@
+-=(ColecoAdam_Senhor notes)=-
+
+Tested: Working Video 720p, 1080p & Sound.
+___
 # [Coleco Adam](https://en.wikipedia.org/wiki/Coleco_Adam) for [MiSTer](https://mister-devel.github.io/MkDocs_MiSTer/)
 
 This core is a conversion of the Colecovision core into verilog. Adam support was added by alanswx and spacexguy (asicguy).  
